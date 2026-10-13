@@ -1,0 +1,19 @@
+# Personal context, not for the public repo
+docs/HANDOFF.md
+
+# Raw Kettle exports (large; manifests are committed instead)
+data/raw/
+
+# Local env and secrets
+.env
+.env.*
+*.key
+gcp-*.json
+
+# Tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+/bin/
