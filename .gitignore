@@ -17,3 +17,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 /bin/
+
+# Collector run output
+data/runs/
