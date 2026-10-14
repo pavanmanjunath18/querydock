@@ -19,7 +19,7 @@ Items marked **[VERIFY IN P1]** can only be confirmed once BigQuery access exist
 - **MongoDB 8.0.32** on the official images, deployed with our own Helm chart. **Go 1.27.2**, **Python 3.13**.
 - **Traces** are stored in Grafana Tempo, next to Prometheus, Loki and Grafana.
 - **The guarantee is layered:** read-only database role → validator → `explain()` gate → server-side limits.
-- **Benchmark models:** `claude-sonnet-5-5` (primary) and `claude-haiku-5-5` (cheaper comparison), with prompt caching. Estimated total ≈ **$58**, with a ~$120 ceiling (§5.6).
+- **Benchmark models:** a local open model on Ollama, **`qwen3.5:9b`** (primary, 3 runs); **Gemini Flash on Vertex AI** (1 run, paid from Google Cloud trial credit); optionally **`claude-haiku-5-5`** through the Message Batches API (1 run, ≈$1, only with approval). All scores go in one table with the model named next to each (§5.5).
 - **Laptop:** 16 GB RAM / 8 cores, arm64. The stack fits in a ~10 GB Docker allocation using single-member replica sets (§7).
 
 ---
@@ -98,7 +98,7 @@ The Kettle README also notes that it "occasionally stops updating", so the table
 
 ### 2.3 Access and cost
 
-- BigQuery sandbox: no billing account; **1 TB of queries and 10 GB of storage per month**; tables expire after 60 days. Querying public datasets is allowed.
+- Project `querydock` is linked to the Google Cloud free-trial billing account, so it is **not** limited to the sandbox. The BigQuery free tier still applies: **1 TB of queries and 10 GB of storage per month**, then $6.25/TB queried, paid from trial credit. Safety nets: a custom quota of ~500 GB/day, budget alerts at $10/$25, and the 500 GB/month stop-and-ask rule.
 - Exporting to GCS needs a billed bucket, so instead **query results are paged straight to local NDJSON** with the Python client. Reading results is not billed as a query. Fallback: write a sandbox table one day at a time and page it with `tabledata.list`.
 - **Bytes scanned are unknown [VERIFY IN P1].** If a table isn't partitioned on `started`, a date filter doesn't reduce the bytes billed: each query costs the size of the referenced columns across the whole table.
 - **Guardrails:**
@@ -138,14 +138,14 @@ WHERE started >= @start AND started < @end;
 ### 2.5 Export plan
 
 **Backfill (once, as soon as access works):**
-1. Dry-run query 4 over all of `all`, with no date filter. If it fits the budget, run it **once** and split the output into UTC days locally. That is one scan instead of 30.
-2. If it doesn't fit, export as many of the newest days as the budget allows, and stop for approval before going further.
-3. Each day is written to `data/raw/kettle-YYYY-MM-DD.ndjson.zst` with a committed manifest: builds, tests, SHA-256, query text, source table, `lastModifiedTime`, export time. `data/raw/` is gitignored.
-4. The first and last days in the window are partial; they're marked `partial: true` and excluded from per-day volume figures.
+1. Run `bq show` (free), then dry-run a `CREATE TABLE querydock.kettle.all_snapshot_<date> AS SELECT <export columns> FROM kubernetes-public.k8s_infra_kettle.all`. That is **one scan** of the public table, and it leaves a copy in our own project. Show the byte count and wait for approval if it would pass the 500 GB stop.
+2. Download our copy into **zstd-compressed Parquet**, one file per UTC day: `data/raw/kettle-YYYY-MM-DD.parquet`. Reading our own table doesn't scan the public one again. Read-path cost is checked before running.
+3. Commit a manifest per day: builds, tests, SHA-256, source table + `lastModifiedTime`, query text, export time. `data/raw/` is gitignored.
+4. The first and last days are partial; they're marked `partial: true` and excluded from per-day volume figures.
 
 **Daily export (ongoing, so no day is lost):**
 - A launchd job on the dev Mac (`deploy/local/com.querydock.kettle-export.plist`) runs `bench/data/export_daily.py` once a day. It's idempotent.
-- **Primary path:** snapshot the whole `day` table (the smallest table) into `data/raw/snapshots/`. Calendar days are assembled from overlapping snapshots, deduplicated on `path`.
+- **Primary path:** append the whole `day` table (the smallest table) to the project's BigQuery snapshot table and write it locally as Parquet under `data/raw/snapshots/`. Calendar days are assembled from overlapping snapshots, deduplicated on `path`.
 - **Catch-up path:** when a gap is detected (laptop asleep, Kettle stalled), it pulls the missing range from `week`. That covers up to 7 days of downtime.
 - **Freezing:** a calendar day is frozen only once it's ≥ 2 days old, because Kettle backfills late builds. Before that the day is provisional.
 - Every run enforces `--maximum_bytes_billed` and the monthly ledger. If projected monthly usage (bytes per day-snapshot × 30, plus backfill) is over 500 GB, the job doesn't run and the maintainer is asked first.
@@ -189,6 +189,8 @@ If Kettle access fails or the data is stale: JUnit artifacts from GitHub Actions
 **`rollup_test_daily`** — one per (tenant, day, job, name): `runs, fails, sum_duration_s, max_duration_s`. Maintained by a scheduled internal job using `$merge`, under a separate write role and outside the validator path.
 **`ingest_checkpoints`**, **`dead_letters`** — ingest bookkeeping.
 Control data (`tenants`, `api_keys`) lives in a separate database, `querydock_control`, which the query role can't read.
+
+**Schema enforcement:** `test_results`, `builds` and `rollup_test_daily` are created with a `$jsonSchema` validator (`validationLevel: "strict"`, `validationAction: "error"`): required fields, BSON types, `status` enum, `duration_s` ≥ 0 or null, and `tenant` matching `^[a-z0-9-]+$`. The ingest service sends documents that fail it to `dead_letters` instead of dropping them. Tests insert bad documents and assert they're rejected. Schemas live in `deploy/mongo/schemas/*.json` and are applied by the init Job.
 
 `occurrence` = the 0-based count of earlier entries with the same name in that build's `test` array. It's stable because export files are frozen.
 
@@ -285,42 +287,39 @@ Questions run against a fixed snapshot of 2 real days, identified by manifest SH
 - Refusals and validator rejections count as wrong.
 
 ### 5.4 Conditions
-- **(a) QueryDock:** the model works through the MCP tools (templates + validated builder, with explain feedback).
+- **(a) QueryDock:** the model works through the MCP tools in a fixed order:
+  1. **Pick a template and fill in its parameters first.**
+  2. **Write a raw pipeline only when no template fits.**
+  3. Every pipeline, from a template or written by hand, goes through the validator and the `explain()` gate. Rejections come back to the model as feedback.
 - **(b) Baseline:** same model and schema description; writes one raw pipeline that runs read-only, with no templates and no retry loop.
 
-### 5.5 Models and run settings (fixed now, before any results)
-- **Models:** primary `claude-sonnet-5-5`, comparison `claude-haiku-5-5`. Every model × condition gets **3 runs**, reported as mean, min and max, plus invalid-pipeline rate and refusal rate. Results files record the model ID, SDK version and date.
-- **Effort and sampling:** effort is pinned explicitly at `high` for both models. Sampling stays at the defaults: these models reject non-default `temperature`, so the 3 runs are what capture run-to-run variance.
-- **No automatic model fallback:** server-side fallback stays off, because a fallback would switch models mid-run. Refusals are scored as wrong and reported (`stop_reason`, `stop_details.category`).
-- **Prompt caching:**
-  - one explicit 5-minute breakpoint at the end of the static prefix (tool definitions + system prompt + schema description)
-  - automatic caching for the growing conversation tail
-  - runs execute sequentially, so the cache stays warm
-  - the harness logs `cache_read_input_tokens` and fails loudly if reads are zero after the first request
-- **Pilot before the full run:** 5 dev-set questions per model × condition, to measure real tokens per question and re-estimate cost before the full run.
+### 5.5 Models and run settings (fixed 2026-10-13, before any results)
 
-### 5.6 Cost estimate (prices from the official pricing page, 2026-10-13)
-
-| Price per MTok | Input | 5m cache write | Cache read | Output |
+| Role | Model (pinned) | Served by | Runs | Paid from |
 |---|---|---|---|---|
-| `claude-sonnet-5-5` | $2.00 | $2.50 | $0.10 | $10.00 |
-| `claude-haiku-5-5` (prompts ≤100K) | $0.10 | $0.125 | $0.01 | $0.50 |
+| Primary | **`qwen3.5:9b`**, Ollama ID `56671c2ab938` (9.0B, Q4_K_M), Ollama 0.35.1 | Ollama on the dev Mac | **3** × 150 per condition | Free (local) |
+| Second | **Gemini Flash**: exact model ID pinned from the Vertex AI model list on the day the project is created, and recorded here before any run | Vertex AI | **1** × 150 per condition | Google Cloud trial credit |
+| Optional reference | **`claude-haiku-5-5`** | Anthropic Message Batches API | **1** × 150 per condition | ≈$1, **only after approval** |
 
-Token assumptions per question (corrected after the pilot):
-- **QueryDock, about 4 model calls:** 38K cache-read + 7K cache-write input, 3.2K output (thinking included).
-- **Baseline, 1 call:** 6K cache-read + 0.2K uncached input, 1.5K output.
-- Prompts stay well under Haiku's 100K higher-price threshold.
+- **Why `qwen3.5:9b`:** the newest small Qwen model, with native tool calling and a reported BFCL-V4 score of 66.1 (Qwen's own figure). At 5.8 GB resident with an 8K context, it fits next to the benchmark backend. A 3-question smoke test on 2026-10-13 produced well-formed calls on all 3 and picked the right tool on 2. That test is not part of the benchmark, and the model was not chosen by tuning against it.
+- **Benchmark backend:** the benchmark runs against a single-node MongoDB holding the frozen 2-day snapshot, plus the API and MCP server. The kind cluster is stopped during local-model runs, which leaves ~8 GB for the model. Latency numbers are never taken from those runs.
+- **Local settings:** `think: false` for speed (recorded), `num_ctx: 32768`, Ollama default sampling. Variance is captured by the 3 runs.
+- **Gemini settings:** the provider's default sampling. Thinking and effort settings are recorded with the results.
+- **Haiku settings:** effort pinned to `medium`, the model's default. Each tool-loop turn is one batch round across all questions (about 4–6 rounds). Batch prompt caching is best-effort, so the cost estimate assumes no cache hits.
+- **Every model:** the same MCP tools, system prompt and schema description. Refusals and malformed tool calls count as wrong and are reported separately. **No model fallback.**
+- **Reporting:** one table, one row per model × condition, with the **model name and pinned version next to every score**, the run count, mean, min–max, invalid-call rate and date. Every measured score is reported, including the weak ones.
 
-| Item | Calls | Sonnet 5.5 | Haiku 5.5 |
-|---|---|---|---|
-| Per question: QueryDock / baseline | — | $0.053 / $0.016 | $0.0029 / $0.0008 |
-| Pilot (5 q × 2 conditions) | 10 | $0.35 | $0.02 |
-| Dev-set tuning (30 q × ~15 iterations, QueryDock) | 450 | $23.85 | $1.31 |
-| Test: QueryDock, 150 q × 3 runs | 450 | $23.85 | $1.31 |
-| Test: baseline, 150 q × 3 runs | 450 | $7.20 | $0.37 |
-| **Subtotal** | | **$55.25** | **$3.01** |
+### 5.6 Cost estimate (2026-10-13)
 
-**Estimated total ≈ $58. Planning ceiling ≈ $120** (2× margin for more turns or thinking than assumed). Recommended API key spend cap: $150/month. No API call is made until the maintainer approves this estimate. After the pilot, the estimate is reissued.
+Per-question token assumptions (corrected after a 5-question pilot): QueryDock ≈ 45K input tokens over about 4 calls + 3.2K output; baseline ≈ 6.2K input + 1.5K output.
+
+| Model | Prices per MTok (in / out) | QueryDock 150 q | Baseline 150 q | Pilot + dev tuning | Total |
+|---|---|---|---|---|---|
+| `qwen3.5:9b` (3 runs) | local | $0 | $0 | $0 | **$0**, about 6–10 h of laptop time |
+| Gemini Flash (1 run) | $0.75 / $3.75 (introductory price until 2026-12-31, global endpoint) | ≈$6.90 | ≈$1.50 | ≈$1.50 | **≈$10 of trial credit** |
+| `claude-haiku-5-5` batch (1 run) | $0.05 / $0.25 (batch, 50% off) | ≈$0.46 | ≈$0.08 | — | **≈$0.55** (≤$1) |
+
+Prompt tuning happens only on the dev set and only with `qwen3.5:9b`. The tuned prompts are frozen before any test run on any model. Before Vertex AI or the Anthropic API is called, the estimate is reissued for approval.
 
 ---
 
@@ -339,6 +338,10 @@ Every result file goes to `docs/results/<topic>-<date>.md` and states the script
 | 7 | NL query accuracy | §5 | Mean (min–max) per model × condition, with model IDs and date |
 | 8 | Index, rollup and shard-key effect | `docs/perf/*.md`: before/after `explain`, shard-key comparison | Plans and tables |
 | 9 | Query latency under load | `bench/k6/query_mix.js`: constant-arrival-rate **150 req/s**, 2 min warm-up + 10 min measured, fixed weighted template mix across tenants, seeded parameters, k6 outside the cluster; median of 3 runs. Baseline per §3.5. Dataset: every real day available, up to ~12M documents, **no synthetic padding** | Baseline and optimized p95, % change, exact document count, "single laptop" |
+| 11 | API versioning | `/v1` and `/v2` run side by side; **one real breaking change** in `/v2`: cursor pagination replaces offset, and `duration_s` (float) becomes `duration_ms` (int). Contract tests pin both versions; `/v1` responses carry a `Deprecation` header | Both test suites green |
+| 12 | Per-tenant RBAC | Roles per tenant: `admin` (create, rotate and revoke that tenant's keys; query) and `reader` (query only). Tests: a reader can't manage keys (403); an admin of A can't touch B's keys (404); revoked keys fail (401) | Test pass/fail in CI |
+| 13 | Schema enforcement | `$jsonSchema` tests (§3.1) | Test pass/fail |
+| 14 | Live demo on AWS | `deploy/terraform/`: one EC2 instance running k3s with the stack (Helm), for a 1–2 day demo, then `terraform destroy`. `terraform plan` + a cost estimate are shown first; **nothing is created without approval** | Demo URL while up; destroy confirmed in `docs/results/` |
 | 10 | Observability | OTel traces CLI → ingest → MongoDB and API → MongoDB in Tempo; Prometheus metrics; Loki logs via Alloy; Grafana dashboards as JSON; alerts: ingest dead-letter rate, API p95 > 300 ms for 5 min, no ingest for 15 min | Screenshots + JSON in the repo |
 
 ---
@@ -366,6 +369,23 @@ Docker Desktop: **10 GB RAM, 6 CPUs, 60 GB disk image** (41 GB free on the host 
 
 Data estimate: ~350 B per test document → ~4.2 GB uncompressed for 12M documents, ~1.5–2 GB on disk compressed, plus 1–2 GB of indexes. The working set is bigger than the 2 GB of total cache.
 
+**Disk plan** (host free space 2026-10-13: 38 GB). Exports are **zstd-compressed Parquet only** (no raw JSON on disk). Prometheus, Loki and Tempo keep **48 hours**.
+
+| Component | Estimate | Basis / control |
+|---|---|---|
+| Kettle Parquet archive (backfill ~30 days) | 3–9 GB | ~0.1–0.3 GB/day compressed (test names dictionary-encode well); measured on day 1 and this row updated |
+| Daily export growth | ~0.1–0.3 GB/day | Same; `day` snapshots are merged into frozen days, then deleted |
+| MongoDB, 2 shards, ~12M docs | 3–4 GB | ~1.5–2 GB of zstd-compressed data (`blockCompressor: zstd`) + 1–2 GB of indexes |
+| Shard-key comparison (2 days, rebuilt 3×) | ~1 GB transient | Dropped after each variant |
+| Benchmark single-node MongoDB (2-day snapshot) | ~0.5 GB | |
+| Prometheus, 48 h | ~0.5 GB | Small cluster, 15 s scrape |
+| Loki, 48 h | ~0.5–1 GB | Info-level logs, no per-document lines |
+| Tempo, 48 h | ~1 GB | 100% sampling normally, 10% head sampling during k6 runs |
+| Container images (Docker + copies inside the kind node) | ~6–7 GB | kind node, mongo 8.0.32, observability, 3 service images |
+| `qwen3.5:9b` | 6.6 GB | Already pulled |
+| Go module + Python caches | ~1.5 GB | |
+| **Total new** | **≈ 24–33 GB** | Tight against 38 GB free, so clearing some space first is recommended |
+
 **Scale-down order if it doesn't fit:**
 1. Drop the second API replica.
 2. Turn off Alertmanager (use Grafana alerting).
@@ -377,7 +397,7 @@ Data estimate: ~350 B per test document → ~4.2 GB uncompressed for 12M documen
 
 ## 8. Plan: 15 working days × ~5 h (≈75 h over 3 weeks)
 
-Each day's exit check has to pass before moving on. The schedule slips rather than skipping an exit check. If time runs short, cut in this order: optional EC2 demo → `/v2` → rollups.
+Each day's exit check has to pass before moving on. The schedule slips rather than skipping an exit check. If time runs short, cut in this order: **rollup collections first, then the Gemini column**. `/v1`+`/v2`, RBAC, schema validation, the Terraform/EC2 demo and model-named scores are required and are not cut.
 
 **Week 1: data and ingest (P1–P2)**
 
@@ -406,8 +426,8 @@ Each day's exit check has to pass before moving on. The schedule slips rather th
 | D11 | All services on kind via Helm; full flow CLI → ingest → mongos → API → MCP | End-to-end smoke test in CI (kind) |
 | D12 | Shard-key comparison (2 days); load every real day; **baseline k6** | `docs/perf/shard-key.md` + baseline results committed |
 | D13 | Indexes + rollups from `explain`; re-run k6 ×3 | Before/after p95 + plans committed |
-| D14 | Chaos ×150; OTel/Tempo, Prometheus, Loki/Alloy, Grafana dashboards + 3 alerts | Duplicate/missing counts committed; dashboards JSON in the repo |
-| D15 | `/v2` breaking change (cursor pagination, `duration_ms`); README with measured numbers, diagram, quickstart; demo video | Every README number links to a results file |
+| D14 | Chaos ×150; `$jsonSchema` validators + tests; OTel/Tempo, Prometheus, Loki/Alloy, Grafana dashboards + 3 alerts | Duplicate/missing counts committed; dashboards JSON in the repo |
+| D15 | `/v2` breaking change (cursor pagination, `duration_ms`); Terraform EC2 + k3s (plan + cost estimate shown first, created only after approval, destroyed after the demo); README with measured numbers, diagram, quickstart; demo video | Every README number links to a results file |
 
 ---
 
@@ -417,9 +437,11 @@ Each day's exit check has to pass before moving on. The schedule slips rather th
 2. **Grafana Tempo** added for traces.
 3. Capacity: **~5 h/day for 2–3 weeks**; plan in §8.
 4. Benchmark: the maintainer **writes part of the 150 and reviews all of them** in week 2.
-5. Models: **`claude-sonnet-5-5` primary, `claude-haiku-5-5` comparison**, prompt caching on, settings per §5.5. Spending needs approval of the §5.6 estimate.
+5. Models (revised 2026-10-13, before any results): **`qwen3.5:9b` on Ollama, primary, 3 runs; Gemini Flash on Vertex AI, 1 run (trial credit); optional `claude-haiku-5-5` via Message Batches, 1 run (≈$1, approval needed)**. Template-first MCP flow. All scores in one table, with the model named next to each.
 6. Repo: **public on GitHub**, pushed as work proceeds; `docs/HANDOFF.md` is gitignored.
-7. Data: **back-fill everything in `all`, then export daily**; stop for approval above 500 GB/month.
+7. Data: **back-fill everything in `all` to zstd Parquet, keep a copy as a BigQuery table in the `querydock` project, then export daily**; stop for approval above 500 GB/month.
+8. Required features (never cut): `/v1` + `/v2` with one breaking change; per-tenant RBAC with tests; `$jsonSchema` validation; Terraform EC2 + k3s demo (approval before creation, destroyed after); model named next to every score. Cut order if behind: rollups, then the Gemini column.
+9. Google Cloud: project `querydock`, BigQuery + Vertex AI APIs, budget alerts at $10 and $25, custom BigQuery query quota of ~500 GB/day. The maintainer does the free-trial activation (payment, identity, terms) personally.
 
 ---
 
