@@ -1,0 +1,58 @@
+{
+  "day": "2026-10-30",
+  "source": "gs://kubernetes-ci-logs (logs/ and pr-logs/), public Prow artifacts",
+  "rules": "kubernetes/test-infra kettle make_db.py + make_json.py @ 528e0fbf0b38 (skipped tests not counted)",
+  "complete": true,
+  "provisional": false,
+  "collected_at": "2026-11-03T04:04:11.093159512Z",
+  "duration_sec": 2202.865852529,
+  "collector_rev": "41b97c07275e0d01a5f26515c5262f03c5bfed48",
+  "params": {
+    "concurrency": 64,
+    "jobs_filter": null,
+    "lookback_hours": 6,
+    "rps": 150,
+    "workers": 128
+  },
+  "stats": {
+    "JobsLogs": 6448,
+    "JobsPR": 1545,
+    "JobsExcluded": 5,
+    "Candidates": 25611,
+    "UnparsableIDs": 0,
+    "BuildsInDay": 20764,
+    "OutOfDay": 4721,
+    "Unfinished": 1,
+    "NoMeta": 125,
+    "Dropped": 0,
+    "Oversized": 0,
+    "DropReasons": {},
+    "JunitFiles": 23405,
+    "JunitBytes": 30449554967,
+    "MalformedJunit": 17,
+    "Tests": 12846079,
+    "TestsFailed": 1538,
+    "Failures": 0,
+    "FailureSamples": null,
+    "StartDelay": {
+      "max": 383,
+      "n": 20764,
+      "p50": 11,
+      "p99": 231,
+      "p999": 314
+    }
+  },
+  "requests": 113627,
+  "retries": 0,
+  "throttled": 0,
+  "not_found": 126,
+  "slow_downs": 0,
+  "download_bytes_wire": 30633120953,
+  "body_bytes_decoded": 30480274415,
+  "parquet": {
+    "file": "kettle-2026-10-30.parquet",
+    "bytes": 109581890,
+    "sha256": "14143e1be4a171902124c0e377c2b30b17270aebae7c454c0c32743d3fd26a4b",
+    "rows": 20764
+  }
+}

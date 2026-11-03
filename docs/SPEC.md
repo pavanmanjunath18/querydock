@@ -60,6 +60,12 @@ Not used: the Bitnami `mongodb-sharded` chart. Its images moved to an unmaintain
 
 ## 2. The Kettle dataset
 
+> **Update (2026-11-03):** the BigQuery dataset described below turned out not to be readable, so the data is collected from
+> Prow's public artifacts using Kettle's own parsing rules instead. See
+> [ADR 0005](decisions/0005-collect-from-prow-public-bucket.md) and
+> [docs/results/data-collection-2026-11-03.md](results/data-collection-2026-11-03.md). The schema and the
+> parsing rules in §2.1 still apply; the BigQuery-specific cost and export text in §2.3-§2.5 is superseded.
+
 ### 2.1 Schema (`kettle/schema.json`, test-infra master)
 
 One row per **build**, with tests nested inside:
