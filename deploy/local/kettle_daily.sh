@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily export: collect every complete UTC day that is >= 2 days old and not yet
+# Daily export: collect every complete UTC day whose end is >= 48 h ago (today minus 3 days) and not yet
 # collected (catches up after the laptop was asleep), then load it into BigQuery.
 # Run by launchd (com.querydock.kettle-daily.plist). Safe to run repeatedly.
 set -euo pipefail
@@ -8,7 +8,7 @@ bin="$repo/bin/querydock"
 runs="$repo/data/runs"
 mkdir -p "$runs"
 oldest_kept_days=89   # the bucket keeps ~90 days; never ask for a day that is already gone
-for back in $(seq "$oldest_kept_days" -1 2); do
+for back in $(seq "$oldest_kept_days" -1 3); do
   day=$(date -u -v-"${back}"d +%F)
   manifest="$repo/data/manifests/kettle-$day.json"
   if [[ -f "$manifest" ]] && python3 -I -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["complete"] else 1)' "$manifest"; then
